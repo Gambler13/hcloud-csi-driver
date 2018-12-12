@@ -35,7 +35,7 @@ import (
 )
 
 const (
-	driverName = "de.apricote.hcloud.csi.volumes"
+	DriverName = "de.apricote.hcloud.csi.volumes"
 )
 
 var (

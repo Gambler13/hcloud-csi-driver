@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 # Configuration to deploy release version of the CSI Hetzner Cloud
 # plugin (https://github.com/apricote/hcloud-csi-driver) compatible with
 # Kubernetes >=v1.10.5
@@ -140,7 +139,7 @@ spec:
       serviceAccount: csi-hcloud-controller-sa
       containers:
         - name: csi-provisioner
-          image: quay.io/k8scsi/csi-provisioner:v0.3.0
+          image: quay.io/k8scsi/csi-provisioner:v0.4.1
           args:
             - "--provisioner=de.apricote.hcloud.csi.volumes"
             - "--csi-address=$(ADDRESS)"
@@ -153,7 +152,7 @@ spec:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
         - name: csi-attacher
-          image: quay.io/k8scsi/csi-attacher:v0.3.0
+          image: quay.io/k8scsi/csi-attacher:v0.4.1
           args:
             - "--v=5"
             - "--csi-address=$(ADDRESS)"
@@ -165,7 +164,7 @@ spec:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
         - name: csi-hcloud-plugin
-          image: apricote/hcloud-csi-driver:v0.0.1
+          image: hexhibit/hcloud-csi-driver:v0.3.0
           args:
             - "--endpoint=$(CSI_ENDPOINT)"
             - "--token=$(HCLOUD_ACCESS_TOKEN)"
@@ -255,7 +254,7 @@ spec:
       hostNetwork: true
       containers:
         - name: driver-registrar
-          image: quay.io/k8scsi/driver-registrar:v0.3.0
+          image: quay.io/k8scsi/driver-registrar:v0.4.1
           args:
             - "--v=5"
             - "--csi-address=$(ADDRESS)"
@@ -275,7 +274,7 @@ spec:
             - name: registration-dir
               mountPath: /registration/
         - name: csi-hcloud-plugin
-          image: apricote/hcloud-csi-driver:v0.0.1
+          image: hexhibit/hcloud-csi-driver:v0.3.0
           args:
             - "--endpoint=$(CSI_ENDPOINT)"
             - "--token=$(HCLOUD_ACCESS_TOKEN)"

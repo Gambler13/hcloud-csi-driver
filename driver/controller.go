@@ -18,13 +18,13 @@ package driver
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
-	csi "github.com/container-storage-interface/spec/lib/go/csi/v0"
+	"github.com/container-storage-interface/spec/lib/go/csi/v0"
 	"github.com/hetznercloud/hcloud-go/hcloud"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
@@ -40,9 +40,23 @@ const (
 )
 
 const (
-	defaultVolumeSizeInGB = 16 * GB
-	minVolumeSizeInGB     = 10 * GB
+	// PublishInfoVolumeName is used to pass the volume name from
+	// `ControllerPublishVolume` to `NodeStageVolume or `NodePublishVolume`
+	PublishInfoVolumeName = DriverName + "/volume-name"
 
+	// minimumVolumeSizeInBytes is used to validate that the user is not trying
+	// to create a volume that is smaller than what we support
+	minimumVolumeSizeInBytes int64 = 10 * GB
+
+	// maximumVolumeSizeInBytes is used to validate that the user is not trying
+	// to create a volume that is larger than what we support
+	maximumVolumeSizeInBytes int64 = 10 * TB
+
+	// defaultVolumeSizeInBytes is used when the user did not provide a size or
+	// the size they provided did not satisfy our requirements
+	defaultVolumeSizeInBytes int64 = 16 * GB
+
+	// createdByDO is used to tag volumes that are created by this CSI plugin
 	createdByHCloud = "hcloud-csi-driver"
 )
 
@@ -66,6 +80,15 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		return nil, status.Error(codes.InvalidArgument, "CreateVolume Volume capabilities must be provided")
 	}
 
+	if !validateCapabilities(req.VolumeCapabilities) {
+		return nil, status.Error(codes.InvalidArgument, "invalid volume capabilities requested. Only SINGLE_NODE_WRITER is supported ('accessModes.ReadWriteOnce' on Kubernetes)")
+	}
+
+	size, err := extractStorage(req.CapacityRange)
+	if err != nil {
+		return nil, status.Errorf(codes.OutOfRange, "invalid capacity range: %v", err)
+	}
+
 	if req.AccessibilityRequirements != nil {
 		for _, t := range req.AccessibilityRequirements.Requisite {
 			location, ok := t.Segments["location"]
@@ -78,11 +101,6 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 			}
 		}
-	}
-
-	size, err := extractStorage(req.CapacityRange)
-	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
 	}
 
 	volumeName := req.Name
@@ -130,15 +148,6 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		Labels: map[string]string{
 			"createdBy": createdByHCloud,
 		},
-	}
-
-	if !validateCapabilities(req.VolumeCapabilities) {
-		return nil, status.Error(codes.AlreadyExists, "invalid volume capabilities requested. Only SINGLE_NODE_WRITER is supported ('accessModes.ReadWriteOnce' on Kubernetes)")
-	}
-
-	ll.Info("verify volume size is allowed")
-	if size < minVolumeSizeInGB {
-		return nil, status.Errorf(codes.OutOfRange, "requested volume size %d GB is lower than supported minimum of %d GB", size/GB, minVolumeSizeInGB/GB)
 	}
 
 	ll.Info("checking volume limit")
@@ -264,8 +273,8 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 			return nil, status.Errorf(codes.NotFound, "volume %q not found", req.VolumeId)
 		}
 		// TODO: replace with actual error handling
-		return nil, status.Errorf(codes.NotFound, "volume %q not found", req.VolumeId)
-		// return nil, err
+		//return nil, status.Errorf(codes.NotFound, "volume %q not found", req.VolumeId)
+		return nil, err
 	}
 
 	// check if server exist before trying to attach the volume to the server
@@ -275,8 +284,8 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 			return nil, status.Errorf(codes.NotFound, "server %q not found", serverID)
 		}
 		// TODO: replace with actual error handling
-		return nil, status.Errorf(codes.NotFound, "server %q not found", serverID)
-		// return nil, err
+		//	return nil, status.Errorf(codes.NotFound, "server %q not found", serverID)
+		return nil, err
 	}
 
 	attachedServer := vol.Server
@@ -285,7 +294,11 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 		attachedID = attachedServer.ID
 		if attachedID == serverID {
 			ll.Info("volume is already attached")
-			return &csi.ControllerPublishVolumeResponse{}, nil
+			return &csi.ControllerPublishVolumeResponse{
+				PublishInfo: map[string]string{
+					PublishInfoVolumeName: vol.Name,
+				},
+			}, nil
 		}
 	}
 
@@ -298,9 +311,32 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	// attach the volume to the correct node
 	action, resp, err := d.hcloudClient.Volume.Attach(ctx, vol, server)
 	if err != nil {
-		return nil, status.Errorf(codes.Aborted, "volume %q could not be attached to server %q: %s", vol.ID, server.ID, err)
-	}
+		// don't do anything if attached
+		if resp != nil && resp.StatusCode == http.StatusUnprocessableEntity {
+			if strings.Contains(err.Error(), "This volume is already attached") {
+				ll.WithFields(logrus.Fields{
+					"error": err,
+					"resp":  resp,
+				}).Warn("assuming volume is attached already")
+				return &csi.ControllerPublishVolumeResponse{
+					PublishInfo: map[string]string{
+						PublishInfoVolumeName: vol.Name,
+					},
+				}, nil
+			}
 
+			if strings.Contains(err.Error(), "Droplet already has a pending event") {
+				ll.WithFields(logrus.Fields{
+					"error": err,
+					"resp":  resp,
+				}).Warn("droplet is not able to detach the volume")
+				// sending an abort makes sure the csi-attacher retries with the next backoff tick
+				return nil, status.Errorf(codes.Aborted, "volume %q couldn't be attached. droplet %d is in process of another action",
+					req.VolumeId, attachedID)
+			}
+		}
+		return nil, err
+	}
 	if action != nil {
 		ll.Info("waiting until volume is attached")
 		if err := d.waitAction(ctx, vol.ID, action.ID); err != nil {
@@ -309,7 +345,11 @@ func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.Controlle
 	}
 
 	ll.Info("volume is attached")
-	return &csi.ControllerPublishVolumeResponse{}, nil
+	return &csi.ControllerPublishVolumeResponse{
+		PublishInfo: map[string]string{
+			PublishInfoVolumeName: vol.Name,
+		},
+	}, nil
 }
 
 // ControllerUnpublishVolume deattaches the given volume from the node
@@ -591,26 +631,77 @@ func (d *Driver) ListSnapshots(ctx context.Context, req *csi.ListSnapshotsReques
 // size.
 func extractStorage(capRange *csi.CapacityRange) (int64, error) {
 	if capRange == nil {
-		return defaultVolumeSizeInGB, nil
+		return defaultVolumeSizeInBytes, nil
 	}
 
-	if capRange.RequiredBytes == 0 && capRange.LimitBytes == 0 {
-		return defaultVolumeSizeInGB, nil
+	requiredBytes := capRange.GetRequiredBytes()
+	requiredSet := 0 < requiredBytes
+	limitBytes := capRange.GetLimitBytes()
+	limitSet := 0 < limitBytes
+
+	if !requiredSet && !limitSet {
+		return defaultVolumeSizeInBytes, nil
 	}
 
-	minSize := capRange.RequiredBytes
-
-	// limitBytes might be zero
-	maxSize := capRange.LimitBytes
-	if capRange.LimitBytes == 0 {
-		maxSize = minSize
+	if requiredSet && limitSet && limitBytes < requiredBytes {
+		return 0, fmt.Errorf("limit (%v) can not be less than required (%v) size", formatBytes(limitBytes), formatBytes(requiredBytes))
 	}
 
-	if minSize == maxSize {
-		return minSize, nil
+	if requiredSet && !limitSet && requiredBytes < minimumVolumeSizeInBytes {
+		return 0, fmt.Errorf("required (%v) can not be less than minimum supported volume size (%v)", formatBytes(requiredBytes), formatBytes(minimumVolumeSizeInBytes))
 	}
 
-	return 0, errors.New("requiredBytes and LimitBytes are not the same")
+	if limitSet && limitBytes < minimumVolumeSizeInBytes {
+		return 0, fmt.Errorf("limit (%v) can not be less than minimum supported volume size (%v)", formatBytes(limitBytes), formatBytes(minimumVolumeSizeInBytes))
+	}
+
+	if requiredSet && requiredBytes > maximumVolumeSizeInBytes {
+		return 0, fmt.Errorf("required (%v) can not exceed maximum supported volume size (%v)", formatBytes(requiredBytes), formatBytes(maximumVolumeSizeInBytes))
+	}
+
+	if !requiredSet && limitSet && limitBytes > maximumVolumeSizeInBytes {
+		return 0, fmt.Errorf("limit (%v) can not exceed maximum supported volume size (%v)", formatBytes(limitBytes), formatBytes(maximumVolumeSizeInBytes))
+	}
+
+	if requiredSet && limitSet && requiredBytes == limitBytes {
+		return requiredBytes, nil
+	}
+
+	if requiredSet {
+		return requiredBytes, nil
+	}
+
+	if limitSet {
+		return limitBytes, nil
+	}
+
+	return defaultVolumeSizeInBytes, nil
+}
+
+func formatBytes(inputBytes int64) string {
+	output := float64(inputBytes)
+	unit := ""
+
+	switch {
+	case inputBytes >= TB:
+		output = output / TB
+		unit = "Ti"
+	case inputBytes >= GB:
+		output = output / GB
+		unit = "Gi"
+	case inputBytes >= MB:
+		output = output / MB
+		unit = "Mi"
+	case inputBytes >= KB:
+		output = output / KB
+		unit = "Ki"
+	case inputBytes == 0:
+		return "0"
+	}
+
+	result := strconv.FormatFloat(output, 'f', 1, 64)
+	result = strings.TrimSuffix(result, ".0")
+	return result + unit
 }
 
 // waitAction waits until the given action for the volume is completed
